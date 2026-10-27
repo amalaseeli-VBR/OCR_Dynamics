@@ -1,0 +1,2 @@
+cd C:\Dynamics_setup\DocMateDynamics
+.\venv\Scripts\python.exe -m streamlit run .\docmate_app_v1.18.001_r01_customer.py

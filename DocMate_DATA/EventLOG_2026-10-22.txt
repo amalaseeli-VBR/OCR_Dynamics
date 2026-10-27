@@ -1,0 +1,9 @@
+[2026-10-22T11:53:55Z] v1.18.001_r01_customer 4b2cdf9a-0ece-f111-a057-002248426575_1_SINV029854 (1).pdf Gemini fallback used threshold=65 recon_threshold=5.00 score=76 diff=0.00 previous_score=8 previous_diff=550.13
+[2026-10-22T11:53:55Z] Worker gemini_fallback_used file=4b2cdf9a-0ece-f111-a057-002248426575_1_SINV029854 (1).pdf
+[2026-10-22T11:53:55Z] Worker booker_purchase_table_skipped_cloud_gemini file=4b2cdf9a-0ece-f111-a057-002248426575_1_SINV029854 (1).pdf
+[2026-10-22T15:05:53Z] v1.18.001_r01_customer d6bac5f5-29ce-f111-a057-002248074f32_1_SINV029854 (1).pdf Gemini fallback used threshold=65 recon_threshold=5.00 score=76 diff=0.00 previous_score=8 previous_diff=550.13
+[2026-10-22T15:05:53Z] Worker gemini_fallback_used file=d6bac5f5-29ce-f111-a057-002248074f32_1_SINV029854 (1).pdf
+[2026-10-22T15:05:53Z] Worker booker_purchase_table_skipped_cloud_gemini file=d6bac5f5-29ce-f111-a057-002248074f32_1_SINV029854 (1).pdf
+[2026-10-22T15:23:52Z] v1.18.001_r01_customer d10665ee-2bce-f111-a057-002248426575_1_SINV029854 (1).pdf Gemini fallback used threshold=65 recon_threshold=5.00 score=76 diff=0.00 previous_score=8 previous_diff=550.13
+[2026-10-22T15:23:52Z] Worker gemini_fallback_used file=d10665ee-2bce-f111-a057-002248426575_1_SINV029854 (1).pdf
+[2026-10-22T15:23:52Z] Worker booker_purchase_table_skipped_cloud_gemini file=d10665ee-2bce-f111-a057-002248426575_1_SINV029854 (1).pdf

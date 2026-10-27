@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DocmateInvoiceV1",
+  "description": "Standardized canonical invoice JSON structure for Business Central (BC) integration.",
+  "type": "object",
+  "required": ["header", "lines"],
+  "properties": {
+    "header": {
+      "type": "object",
+      "required": ["invoiceNumber", "invoiceDate", "supplier", "totals"],
+      "properties": {
+        "docmateInvoiceId": { "type": "string" },
+        "invoiceNumber": { "type": "string" },
+        "invoiceDate": { "type": "string" },
+        "dueDate": { "type": "string" },
+        "currency": { "type": "string", "default": "GBP" },
+        "supplier": {
+          "type": "object",
+          "required": ["rawName"],
+          "properties": {
+            "rawName": { "type": "string" },
+            "vatRegistrationNo": { "type": "string" },
+            "supplierCode": { "type": "string" }
+          }
+        },
+        "customer": {
+          "type": "object",
+          "properties": {
+            "rawName": { "type": "string" },
+            "vatRegistrationNo": { "type": "string" },
+            "customerCode": { "type": "string" }
+          }
+        },
+        "totals": {
+          "type": "object",
+          "required": ["netAmount", "vatAmount", "grossAmount"],
+          "properties": {
+            "netAmount": { "type": ["number", "null"] },
+            "vatAmount": { "type": ["number", "null"] },
+            "grossAmount": { "type": ["number", "null"] }
+          }
+        },
+        "metadata": {
+          "type": "object"
+        }
+      }
+    },
+    "lines": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["lineNumber", "description"],
+        "properties": {
+          "lineNumber": { "type": "integer" },
+          "itemCode": { "type": "string" },
+          "barcode": { "type": "string" },
+          "description": { "type": "string" },
+          "quantity": { "type": ["number", "null"] },
+          "unitPrice": { "type": ["number", "null"] },
+          "netAmount": { "type": ["number", "null"] },
+          "vatRate": { "type": ["number", "null"] },
+          "vatAmount": { "type": ["number", "null"] }
+        }
+      }
+    }
+  }
+}

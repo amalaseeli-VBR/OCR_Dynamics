@@ -1,0 +1,910 @@
+"""OCR to the supplied Purchase Header (38)/Purchase Line (39) captions.
+
+This is a SQL handoff contract for the external sender, not a native API body.
+Only observed values are emitted; BC identifiers are never inferred from OCR.
+
+The tag mapping lives in bc_field_mapping.json so support can maintain it
+(Admin > BC Field Mapping) without code changes. The defaults below are used
+only when that file does not exist.
+
+VAT follows BC: line VAT is not sent (BC calculates it with the company rounding
+rules). DocMate recalculates VAT per tax band (lines at 5 decimals, band totals at
+2) and compares it with the invoice VAT; a difference within the allowed tolerance
+is reported as the VAT difference, anything larger is held for review.
+"""
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import json
+import math
+from pathlib import Path
+import re
+
+from .pdf_evidence import PdfEvidence
+
+
+MAPPING_FILE = Path(__file__).resolve().parent / 'bc_field_mapping.json'
+FIELD_TYPES = ('text', 'decimal', 'integer', 'date')
+SECTIONS = ('header', 'lines')
+
+# A printed "Discount" column is stored as the tag 'discount' without saying whether it
+# is a % or an amount; a supplier rule decides which BC field it goes to.
+DISCOUNT_TAG = 'discount'
+DISCOUNT_PERCENT = 'Line Discount %'
+DISCOUNT_AMOUNT = 'Line Discount Amount'
+PRICES_INCL_VAT = 'Prices Including VAT'
+
+# Delivery/shipping/freight charges are moved from the header to a line item with this fixed code.
+# BC handles it per client setup (non-stock item, G/L account, charge item, etc.).
+DELIVERY_ITEM_CODE = 'DELIVERY'
+DELIVERY_DESCRIPTION = 'Delivery Charge'
+DELIVERY_HEADER_TAGS = ('shippingAmount', 'deliveryCharge', 'freightAmount')
+
+DEFAULT_VAT_RULES = {'maxVatDifference': 0.01, 'lineRoundingDecimals': 5}
+
+# Values DocMate adds about the extraction itself, never printed on the PDF.
+SYSTEM_TAGS = {'extractionMode'}
+# DocMate numbers the lines, but BC needs the line number in the line data.
+ALWAYS_IN_DATA = {'Line No.'}
+# A printed zero is real only where zero means something (e.g. VAT 0.00, VAT 0%);
+# elsewhere (quantity, unit cost, por...) a zero is DocMate's placeholder for "not on the PDF".
+ZERO_MEANINGFUL = {'Amount', 'Doc. Amount VAT', 'Doc. Amount Incl. VAT', 'VAT %', 'Amount Including VAT'}
+_ISO_DATE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+# Patterns that identify non-business noise in PDF notes/blocks (T&C, legal, help text, payment how-to).
+_NOTE_NOISE = re.compile(
+    r'terms\s+(?:and|&)\s+(?:conditions|services)'
+    r'|(?:check|see)\s+(?:our|the)\s+FAQ'
+    r'|contact\s+us\s+at'
+    r'|www\.\S+\.\S+'
+    r'|billing\s+permissions'
+    r'|under\s+article\s+\d'
+    r'|council\s+directive'
+    r'|pay\s+by\s+(?:credit\s+card|wire\s+transfer|cheque|check)'
+    r'|subject\s+to\s+(?:VAT|tax)'
+    r'|how\s+to\s+pay'
+    r'|customer\s+terms'
+    r'|@\w+\.\w+'
+    r'|privacy\s+policy'
+    r'|all\s+(?:fees|rights)\s+(?:are|reserved)'
+    r'|need\s+help\s+interpreting'
+    r'|manage\s+your\s+subscription'
+    r'|visit\s+your\s+account'
+    r'|requires?\s+that\s+you\s+have'
+    r'|terms\s+that\s+apply'
+    r'|help\s+(?:interpreting|understanding)'
+    r'|\bFAQs?\b.*billing',
+    re.IGNORECASE,
+)
+
+DEFAULT_FIELD_MAPPING = {
+    'header': [
+        {'bcField': 'Buy-from Vendor Name', 'docmateTags': ['supplierName'], 'type': 'text'},
+        {'bcField': 'Ship-to Name', 'docmateTags': ['customerName', 'customer_name'], 'type': 'text'},
+        {'bcField': 'Vendor Invoice No.', 'docmateTags': ['invoiceNumber'], 'type': 'text'},
+        {'bcField': 'Document Date', 'docmateTags': ['invoiceDate'], 'type': 'date'},
+        {'bcField': 'Due Date', 'docmateTags': ['dueDate', 'paymentDueDate'], 'type': 'date'},
+        {'bcField': 'Vendor Order No.', 'docmateTags': ['orderNumber', 'orderNo'], 'type': 'text'},
+        {'bcField': 'Our Account No.', 'docmateTags': ['accountNumber', 'accountNo'], 'type': 'text'},
+        {'bcField': 'Your Reference', 'docmateTags': ['customerPONumber', 'purchaseOrderNumber', 'poNumber'],
+         'type': 'text'},
+        {'bcField': 'Currency Code', 'docmateTags': ['currency'], 'type': 'text'},
+        {'bcField': 'VAT Registration No.',
+         'docmateTags': ['supplierVatNo', 'vatRegistrationNumber', 'vatNumber', 'supplierVatNumber'], 'type': 'text'},
+        {'bcField': 'Buy-from Address', 'docmateTags': ['supplierAddressLine1'], 'type': 'text'},
+        {'bcField': 'Buy-from Address 2', 'docmateTags': ['supplierAddressLine2'], 'type': 'text'},
+        {'bcField': 'Buy-from City', 'docmateTags': ['supplierCity'], 'type': 'text'},
+        {'bcField': 'Buy-from Postcode', 'docmateTags': ['supplierPostCode', 'supplierPostalCode'], 'type': 'text'},
+        {'bcField': 'Buy-from Country/Region Code', 'docmateTags': ['supplierCountryCode'], 'type': 'text'},
+        {'bcField': 'Vendor Shipment No.', 'docmateTags': ['deliveryNoteNumber', 'deliveryNoteNo'], 'type': 'text'},
+        {'bcField': 'Ship-to Address', 'docmateTags': ['shipToAddressLine1'], 'type': 'text'},
+        {'bcField': 'Ship-to Address 2', 'docmateTags': ['shipToAddressLine2'], 'type': 'text'},
+        {'bcField': 'Ship-to City', 'docmateTags': ['shipToCity'], 'type': 'text'},
+        {'bcField': 'Ship-to Postcode', 'docmateTags': ['shipToPostCode'], 'type': 'text'},
+        {'bcField': 'Ship-to Country/Region Code', 'docmateTags': ['shipToCountryCode'], 'type': 'text'},
+        {'bcField': 'Pay-to Name', 'docmateTags': ['payToName'], 'type': 'text'},
+        {'bcField': 'Pay-to Address', 'docmateTags': ['payToAddressLine1'], 'type': 'text'},
+        {'bcField': 'Pay-to Address 2', 'docmateTags': ['payToAddressLine2'], 'type': 'text'},
+        {'bcField': 'Pay-to City', 'docmateTags': ['payToCity'], 'type': 'text'},
+        {'bcField': 'Pay-to Postcode', 'docmateTags': ['payToPostCode'], 'type': 'text'},
+        {'bcField': 'Pay-to Country/Region Code', 'docmateTags': ['payToCountryCode'], 'type': 'text'},
+        {'bcField': 'Amount', 'docmateTags': ['totalNet'], 'type': 'decimal'},
+        {'bcField': 'Doc. Amount VAT', 'docmateTags': ['totalVat'], 'type': 'decimal'},
+        {'bcField': 'Doc. Amount Incl. VAT', 'docmateTags': ['totalGross', 'totalAmount'], 'type': 'decimal'},
+    ],
+    'lines': [
+        {'bcField': 'Line No.', 'docmateTags': ['lineNo', 'lineNumber'], 'type': 'integer'},
+        {'bcField': 'Vendor Item No.', 'docmateTags': ['code', 'itemCode', 'item_code'], 'type': 'text'},
+        {'bcField': 'Description', 'docmateTags': ['description'], 'type': 'text'},
+        {'bcField': 'Description 2', 'docmateTags': ['description2'], 'type': 'text'},
+        {'bcField': 'Unit of Measure', 'docmateTags': ['unitOfMeasure', 'unitSize'], 'type': 'text'},
+        {'bcField': 'Unit of Measure Code', 'docmateTags': ['unitOfMeasureCode'], 'type': 'text'},
+        {'bcField': 'Quantity', 'docmateTags': ['qty', 'quantity'], 'type': 'decimal'},
+        {'bcField': 'Direct Unit Cost', 'docmateTags': ['unitPrice', 'price'], 'type': 'decimal'},
+        {'bcField': 'Line Discount %', 'docmateTags': ['discountPercent', 'discountRate', 'discountPct'],
+         'type': 'decimal'},
+        {'bcField': 'Line Discount Amount', 'docmateTags': ['discountAmount', 'lineDiscount'], 'type': 'decimal'},
+        {'bcField': 'Amount', 'docmateTags': ['lineNet', 'netAmount', 'lineAmount'], 'type': 'decimal'},
+        {'bcField': 'VAT %', 'docmateTags': ['vatRate', 'vat_rate'], 'type': 'decimal'},
+        {'bcField': 'Amount Including VAT', 'docmateTags': ['lineGross'], 'type': 'decimal'},
+    ],
+    # Per-supplier exceptions: the same DocMate tag sent to a different BC field.
+    # e.g. {'supplier': 'Booker', 'section': 'lines', 'docmateTag': 'discount', 'bcField': 'Line Discount %'}
+    'supplierRules': [],
+    # Per-supplier VAT basis of printed unit prices, sent as Prices Including VAT.
+    # e.g. {'supplier': 'Booker', 'pricesIncludingVat': False}
+    'supplierSettings': [],
+    'vatRules': dict(DEFAULT_VAT_RULES),
+    'pdfLabels': None,  # filled below with DEFAULT_PDF_LABELS
+}
+
+
+# Confirmed pilot exclusions: preserve evidence without updating PO/vendor data.
+CONFIRMED_EXCLUSIONS = {
+    'header': {
+        'iban': ['iban', 'IBAN'],
+        'swiftCode': ['swiftCode', 'SwiftCode'],
+        'supplierPhone': ['supplierPhone', 'SupplierPhone'],
+        'supplierEmail': ['supplierEmail', 'SupplierEmail'],
+        'supplierWebsite': ['supplierWebsite', 'SupplierWebsite'],
+        'supplierAddress': ['supplierAddress'],
+        'supplierAddressLine1': ['supplierAddressLine1'],
+        'supplierAddressLine2': ['supplierAddressLine2'],
+        'supplierCity': ['supplierCity'],
+        'supplierPostCode': ['supplierPostCode', 'supplierPostalCode'],
+        'supplierCountryCode': ['supplierCountryCode'],
+        'customerVatNo': ['customerVatNo', 'customerVatNumber'],
+        'customerAddress': ['customerAddress'],
+        'deliveryAddress': ['deliveryAddress'],
+        'shipToAddressLine1': ['shipToAddressLine1'],
+        'shipToAddressLine2': ['shipToAddressLine2'],
+        'shipToCity': ['shipToCity'],
+        'shipToPostCode': ['shipToPostCode'],
+        'shipToCountryCode': ['shipToCountryCode'],
+        'paymentTerms': ['paymentTerms'],
+    },
+    'lines': {'VAT_Amount': ['VAT_Amount', 'vatAmount', 'vat_amount']},
+}
+
+
+def is_excluded_field(field):
+    """Z_ codes describe intentional exclusions, never writable BC fields."""
+    return str(field).startswith('Z_')
+
+
+def apply_confirmed_mapping(config):
+    """Apply confirmed pilot decisions, retaining unrelated support configuration."""
+    for section, exclusions in CONFIRMED_EXCLUSIONS.items():
+        tags = {tag for aliases in exclusions.values() for tag in aliases}
+        if section == 'header':
+            tags.update(('customerNumber', 'customerNo'))
+        retained = []
+        for entry in config[section]:
+            aliases = [tag for tag in entry['docmateTags'] if tag not in tags]
+            if aliases:
+                retained.append(dict(entry, docmateTags=aliases))
+        for code, aliases in exclusions.items():
+            retained.append({'bcField': 'Z_' + code, 'docmateTags': aliases, 'type': 'text'})
+        if section == 'header':
+            vendor = next((e for e in retained if e['bcField'] == 'Buy-from Vendor No.'), None)
+            if vendor:
+                vendor['docmateTags'] = ['customerNumber', 'customerNo'] + vendor['docmateTags']
+            else:
+                retained.append({'bcField': 'Buy-from Vendor No.',
+                                 'docmateTags': ['customerNumber', 'customerNo'], 'type': 'text'})
+        config[section] = retained
+    return config
+
+
+apply_confirmed_mapping(DEFAULT_FIELD_MAPPING)
+
+
+# Printed labels (any language) -> DocMate tags, used to map pdfData onto BC tags. Matching ignores
+# case, accents, punctuation, currency signs/codes, percentages and "(...)", e.g. 'Total GBP Incl. VAT'
+# matches 'total incl vat'. Support can extend these lists in Admin > BC Field Mapping.
+DEFAULT_PDF_LABELS = {
+    'header': {
+        'invoiceNumber': ['Invoice No', 'Invoice No.', 'Invoice #', 'Invoice Number', 'Inv No', 'Document No',
+                          'Factuurnummer', 'Factuur nr', 'Facture', 'N° facture', 'Numéro de facture',
+                          'Rechnungsnummer', 'Rechnung Nr', 'Számla sorszáma', 'Számlaszám'],
+        'invoiceDate': ['Invoice Date', 'Date', 'Date / Tax Point', 'Tax Point', 'Doc Date', 'Document Date',
+                        'Factuurdatum', 'Date de facture', 'Date facture', 'Rechnungsdatum', 'Kelt', 'Posting Date'],
+        'dueDate': ['Due Date', 'Payment Due', 'Payment Due Date', 'Vervaldatum', 'Échéance', "Date d'échéance",
+                    'Fälligkeitsdatum', 'Fizetési határidő'],
+        'orderNumber': ['Order No', 'Order No.', 'Our Order No.', 'Order Number', 'Sales Order', 'Job No.',
+                        'Bestelnummer', 'N° commande', 'Auftragsnummer'],
+        'customerPONumber': ['Your Order No.', 'Your Order Number', 'PO Number', 'PO. Reference No', 'PO Reference',
+                             'Purchase Order', 'Your Ref.', 'Your ref', 'Your Reference', 'Customer Reference number',
+                             'Uw referentie', 'Votre réf.', 'Votre référence', 'Ihre Referenz'],
+        'accountNumber': ['Account Number', 'Account', 'Customer No.', 'Customer Number', 'Customer Account',
+                          'N° client', 'Debiteurennummer', 'Klantnummer', 'Kundennummer', 'Hub ID'],
+        'supplierVatNo': ['VAT Reg No', 'VAT Reg. No.', 'VAT registered', 'VAT Number', 'Supplier VAT', 'BTW',
+                          'BTW nummer', 'N° TVA', 'TVA intracommunautaire', 'USt-IdNr.', 'EU Tax Nr'],
+        'customerVatNumber': ['Uw BTW nummer', 'Uw BTW-nummer', 'Your VAT number', 'Customer VAT'],
+        'currency': ['Currency', 'Devise', 'Valuta', 'Währung'],
+        'totalNet': ['Subtotal', 'Sub Total', 'Subtotal (without taxes)', 'Net', 'Net Amount', 'Total Net Amount',
+                     'Total Net', 'Total excl. VAT', 'Total Ex Tax', 'Total Ex VAT', 'Totaal exclusief BTW',
+                     'TOTAL HT', 'Total HT net', 'Base HT', 'Supplies', 'Nettobetrag', 'Goods'],
+        'totalVat': ['VAT', 'VAT Amount', 'Total VAT', 'VAT Total', 'BTW', 'BTW laag, exclusief', 'TVA',
+                     'Montant TVA', 'MwSt', 'Tax'],
+        'totalGross': ['Total', 'Total Due', 'Total Amount', 'Amount Due', 'Balance Due', 'Invoice Total',
+                       'Total Incl. VAT', 'Total incl VAT', 'Totaal te voldoen', 'Totaal', 'TOTAL TTC', 'Total TTC',
+                       'Montant', 'Net à payer', 'Gesamtbetrag', 'Total to pay'],
+        'paymentTerms': ['Payment Terms', 'Terms', 'Betalingstermijn', 'Règlement', 'Conditions de paiement',
+                         'Zahlungsbedingungen', 'Payment Method'],
+        'deliveryNoteNumber': ['Delivery Note', 'Delivery Note No', 'Pakbonnummer', 'Bon de livraison', 'Lieferschein'],
+        'shippingAmount': ['Carriage', 'Shipping', 'Delivery Charge', 'Frais de port HT', 'Verzendkosten'],
+    },
+    'lines': {
+        'code': ['Item Code', 'Code', 'Item number', 'Item No', 'Artikel', 'Product Code', 'Part No', 'Réf.', 'No.'],
+        'description': ['Description', 'Item', 'Omschrijving', 'Désignation', 'Libellé', 'Product or Service',
+                        'Activity', 'Beschreibung', 'Granule Description'],
+        'qty': ['Qty', 'Qty.', 'Quantity', 'Aantal', 'Qté', 'Quantité', 'Menge', 'Units'],
+        'unitPrice': ['Unit Price', 'Price', 'Rate', 'Unit Cost', 'Prijs', 'Prijs/eenh.', 'Prix HT', 'PU HT',
+                      'Prix unitaire', 'Einzelpreis'],
+        'discount': ['Discount', 'Disc.', 'Rem.', 'Remise', 'Korting', 'Rabatt'],
+        'lineNet': ['Amount', 'Total', 'Net', 'Net Value', 'Value', 'Line Amount', 'Line Total', 'Totaalbedrag',
+                    'Totaal', 'Total HT', 'Montant HT', 'Unit Total', 'Betrag'],
+        'vatRate': ['VAT %', 'VAT Rate', 'VAT', 'BTW', 'BTW %', 'TVA', 'Taux', 'MwSt %'],
+        'vatAmount': ['VAT Amount', 'Montant TVA'],
+        'lineGross': ['Gross value', 'Gross', 'Total TTC'],
+    },
+    # Address headings -> BC address group (Buy-from = supplier, Ship-to = our company, Pay-to = remit to)
+    'addresses': {
+        'Buy-from': ['Vendor', 'Supplier', 'From', 'Leverancier', 'Fournisseur', 'Lieferant'],
+        'Ship-to': ['Billed to', 'Bill to', 'Invoice to', 'Invoice To', 'Invoice address', 'Invoice Address',
+                    'Company address', 'Customer', 'Delivery Address', 'Ship to', 'Deliver to', 'Afleveradres',
+                    'Factuuradres', 'Adresse de livraison', 'Adress de livrasion', 'Adresse de facturation',
+                    'Lieferadresse', 'Rechnungsadresse'],
+        'Pay-to': ['Make checks payable to', 'Remit to', 'Pay to', 'Payable to'],
+    },
+}
+DEFAULT_FIELD_MAPPING['pdfLabels'] = DEFAULT_PDF_LABELS
+
+
+def _as_fields(entries):
+    return {e['bcField']: tuple(e['docmateTags']) for e in entries}
+
+
+# Kept for callers that import the built-in defaults directly.
+HEADER_FIELDS = _as_fields(DEFAULT_FIELD_MAPPING['header'])
+LINE_FIELDS = _as_fields(DEFAULT_FIELD_MAPPING['lines'])
+
+
+def _validate_rules(config, errors):
+    rules = config.get('supplierRules', [])
+    if not isinstance(rules, list):
+        errors.append('"supplierRules" must be a list.')
+        return
+    fields = {s: {str(e.get('bcField') or '').strip() for e in config.get(s) or [] if isinstance(e, dict)}
+              for s in SECTIONS}
+    seen = set()
+    for row, rule in enumerate(rules, 1):
+        where = f'supplier rule {row}'
+        if not isinstance(rule, dict):
+            errors.append(f'{where}: must be an object.')
+            continue
+        supplier = str(rule.get('supplier') or '').strip()
+        section = rule.get('section')
+        tag = str(rule.get('docmateTag') or '').strip()
+        field = str(rule.get('bcField') or '').strip()
+        if not supplier or not tag or not field:
+            errors.append(f'{where}: supplier, DocMate tag and BC field are all required.')
+            continue
+        if section not in SECTIONS:
+            errors.append(f'{where}: section must be "header" or "lines".')
+            continue
+        if field not in fields[section]:
+            errors.append(f'{where}: BC field "{field}" is not in the {section} mapping.')
+        key = (supplier.lower(), section, tag)
+        if key in seen:
+            errors.append(f'{where}: "{supplier}" already has a rule for tag "{tag}".')
+        seen.add(key)
+
+
+def _validate_settings(config, errors):
+    settings = config.get('supplierSettings', [])
+    if not isinstance(settings, list):
+        errors.append('"supplierSettings" must be a list.')
+    else:
+        seen = set()
+        for row, setting in enumerate(settings, 1):
+            where = f'supplier setting {row}'
+            if not isinstance(setting, dict) or not str(setting.get('supplier') or '').strip():
+                errors.append(f'{where}: supplier is required.')
+                continue
+            if not isinstance(setting.get('pricesIncludingVat'), bool):
+                errors.append(f'{where}: Prices Including VAT must be true or false.')
+            name = str(setting['supplier']).strip().lower()
+            if name in seen:
+                errors.append(f'{where}: "{setting["supplier"]}" is listed twice.')
+            seen.add(name)
+    vat = config.get('vatRules', DEFAULT_VAT_RULES)
+    if not isinstance(vat, dict):
+        errors.append('"vatRules" must be an object.')
+        return
+    try:
+        if not 0 <= float(vat.get('maxVatDifference', 0.01)) <= 1:
+            raise ValueError()
+    except (TypeError, ValueError):
+        errors.append('Max VAT difference must be a number from 0 to 1.')
+    if vat.get('lineRoundingDecimals', 5) not in (2, 3, 4, 5):
+        errors.append('Line VAT rounding must be 2, 3, 4 or 5 decimals.')
+
+
+def validate_field_mapping(config):
+    """Return a list of problems; an empty list means the mapping is usable."""
+    if not isinstance(config, dict):
+        return ['Mapping must be a JSON object with "header" and "lines" lists.']
+    errors = []
+    for section in SECTIONS:
+        entries = config.get(section)
+        if not isinstance(entries, list) or not entries:
+            errors.append(f'"{section}" must be a non-empty list.')
+            continue
+        seen_fields, seen_tags = set(), {}
+        for row, entry in enumerate(entries, 1):
+            where = f'{section} row {row}'
+            if not isinstance(entry, dict):
+                errors.append(f'{where}: must be an object.')
+                continue
+            field = str(entry.get('bcField') or '').strip()
+            tags = entry.get('docmateTags')
+            if not field:
+                errors.append(f'{where}: BC field name is empty.')
+            elif field in seen_fields:
+                errors.append(f'{where}: BC field "{field}" is listed twice.')
+            seen_fields.add(field)
+            if not isinstance(tags, list) or not any(str(t).strip() for t in tags):
+                errors.append(f'{where}: needs at least one DocMate tag.')
+                tags = []
+            for tag in tags:
+                tag = str(tag).strip()
+                if tag and tag in seen_tags and seen_tags[tag] != field:
+                    errors.append(f'{where}: tag "{tag}" is already used for "{seen_tags[tag]}".')
+                seen_tags.setdefault(tag, field)
+            if entry.get('type', 'text') not in FIELD_TYPES:
+                errors.append(f'{where}: type must be one of {", ".join(FIELD_TYPES)}.')
+    _validate_rules(config, errors)
+    _validate_settings(config, errors)
+    _validate_pdf_labels(config, errors)
+    return errors
+
+
+def _normalise(config):
+    result = {
+        section: [
+            {'bcField': str(e['bcField']).strip(),
+             'docmateTags': [str(t).strip() for t in e['docmateTags'] if str(t).strip()],
+             'type': e.get('type', 'text')}
+            for e in config[section]
+        ]
+        for section in SECTIONS
+    }
+    result['supplierRules'] = [
+        {'supplier': str(r['supplier']).strip(), 'section': r['section'],
+         'docmateTag': str(r['docmateTag']).strip(), 'bcField': str(r['bcField']).strip()}
+        for r in config.get('supplierRules', [])
+    ]
+    result['supplierSettings'] = [
+        {'supplier': str(s['supplier']).strip(), 'pricesIncludingVat': s['pricesIncludingVat']}
+        for s in config.get('supplierSettings', [])
+    ]
+    vat = dict(DEFAULT_VAT_RULES, **config.get('vatRules', {}))
+    result['vatRules'] = {'maxVatDifference': float(vat['maxVatDifference']),
+                          'lineRoundingDecimals': int(vat['lineRoundingDecimals'])}
+    labels = config.get('pdfLabels') or DEFAULT_PDF_LABELS
+    result['pdfLabels'] = {section: {str(k).strip(): [str(l).strip() for l in v if str(l).strip()]
+                                     for k, v in (labels.get(section) or {}).items() if str(k).strip()}
+                           for section in ('header', 'lines', 'addresses')}
+    return result
+
+
+def _validate_pdf_labels(config, errors):
+    labels = config.get('pdfLabels')
+    if labels is None:
+        return  # older mapping files: defaults are used
+    if not isinstance(labels, dict):
+        errors.append('"pdfLabels" must be an object.')
+        return
+    for section in ('header', 'lines', 'addresses'):
+        entries = labels.get(section, {})
+        if not isinstance(entries, dict) or any(not isinstance(v, list) for v in entries.values()):
+            errors.append(f'pdfLabels "{section}" must map each tag to a list of printed labels.')
+    for group in (labels.get('addresses') or {}):
+        if group not in ('Buy-from', 'Ship-to', 'Pay-to'):
+            errors.append(f'pdfLabels address group "{group}" must be Buy-from, Ship-to or Pay-to.')
+
+
+def load_field_mapping(path=None):
+    """Load the support-maintained mapping; a broken file fails rather than sending wrong tags."""
+    path = Path(path or MAPPING_FILE)
+    if not path.exists():
+        return _normalise(DEFAULT_FIELD_MAPPING)
+    config = json.loads(path.read_text(encoding='utf-8-sig'))
+    errors = validate_field_mapping(config)
+    if errors:
+        raise ValueError(f'BC field mapping {path.name} is invalid: ' + '; '.join(errors))
+    return _normalise(config)
+
+
+def save_field_mapping(config, path=None):
+    """Validate, keep a .bak of the previous file, then write the new mapping."""
+    errors = validate_field_mapping(config)
+    if errors:
+        raise ValueError('; '.join(errors))
+    path = Path(path or MAPPING_FILE)
+    if path.exists():
+        path.with_suffix('.json.bak').write_text(path.read_text(encoding='utf-8-sig'), encoding='utf-8')
+    tmp = path.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(_normalise(config), indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    tmp.replace(path)
+
+
+_THOUSANDS = re.compile(r'^-?\d{1,3}(,\d{3})+(\.\d+)?$')
+
+
+def _number(value):
+    """Read printed numbers such as '£1,234.50', '10%' or '5.00-' (trailing minus = credit)."""
+    if isinstance(value, bool):
+        raise ValueError()
+    text = str(value).strip().replace('£', '').replace('$', '').replace('€', '').strip()
+    if text.endswith('%'):
+        text = text[:-1].strip()
+    if text.endswith('-'):
+        text = '-' + text[:-1].strip()
+    if _THOUSANDS.match(text):
+        text = text.replace(',', '')
+    number = Decimal(text)
+    if not number.is_finite() or not math.isfinite(float(number)):
+        raise ValueError()
+    return number
+
+
+def _convert(value, field, kind, alias):
+    if kind not in ('decimal', 'integer'):
+        return value
+    try:
+        number = _number(value)
+        if kind == 'integer':
+            if number <= 0 or number != number.to_integral_value():
+                raise ValueError()
+            return int(number)
+        return float(number)
+    except (InvalidOperation, ValueError, OverflowError):
+        raise ValueError(f'Invalid numeric OCR field {alias}: cannot map to {field}')
+
+
+def _for_supplier(items, supplier_name):
+    """Entries whose supplier text is part of the extracted supplier name (case-insensitive)."""
+    name = str(supplier_name or '').strip().lower()
+    if not name:
+        return []
+    return [i for i in items if i['supplier'].lower() in name]
+
+
+def supplier_rules_for(field_mapping, supplier_name):
+    return _for_supplier(field_mapping.get('supplierRules', []), supplier_name)
+
+
+def prices_including_vat_for(field_mapping, supplier_name):
+    """True/False from the supplier setting, None when the supplier has no setting."""
+    matches = _for_supplier(field_mapping.get('supplierSettings', []), supplier_name)
+    return matches[0]['pricesIncludingVat'] if matches else None
+
+
+def _effective_entries(entries, rules, section):
+    """Apply supplier rules: move each rule's tag from its default BC field to the rule's field."""
+    entries = [dict(e, docmateTags=list(e['docmateTags'])) for e in entries]
+    by_field = {e['bcField']: e for e in entries}
+    for rule in rules:
+        if rule['section'] != section or rule['bcField'] not in by_field:
+            continue
+        for entry in entries:
+            if rule['docmateTag'] in entry['docmateTags']:
+                entry['docmateTags'].remove(rule['docmateTag'])
+        by_field[rule['bcField']]['docmateTags'].insert(0, rule['docmateTag'])
+    return entries
+
+
+def _map(source, entries):
+    result, used = {}, {}
+    for entry in entries:
+        for alias in entry['docmateTags']:
+            value = source.get(alias)
+            if value is None or value == '' or (isinstance(value, str) and not value.strip()):
+                continue
+            result[entry['bcField']] = _convert(value, entry['bcField'], entry['type'], alias)
+            used[alias] = entry['bcField']
+            break
+    return result, used
+
+
+# ---- line maths -------------------------------------------------------------
+
+def _dec(line, field):
+    try:
+        return Decimal(str(line[field]))
+    except (KeyError, InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _line_totals(line):
+    """(net, gross) of the line; one may be derived from the other with the VAT %."""
+    net, gross, rate = _dec(line, 'Amount'), _dec(line, 'Amount Including VAT'), _dec(line, 'VAT %')
+    if gross is None and net is not None and rate is not None:
+        gross = net * (1 + rate / 100)
+    if net is None and gross is not None and rate is not None:
+        net = gross * 100 / (100 + rate)
+    return net, gross
+
+
+def _priced_total(line, discount=None, kind=None):
+    qty, price = _dec(line, 'Quantity'), _dec(line, 'Direct Unit Cost')
+    if qty is None or price is None:
+        return None
+    total = qty * price
+    if discount:
+        total = total * (1 - discount / 100) if kind == 'percent' else total - abs(discount)
+    return total
+
+
+def _fits(line, incl_vat, discount=None, kind=None):
+    """Does qty x price (less discount) equal the line total? None when it cannot be checked."""
+    expected = _priced_total(line, discount, kind)
+    net, gross = _line_totals(line)
+    target = gross if incl_vat else net
+    if expected is None or target is None:
+        return None
+    return abs(expected - target) <= Decimal('0.05') + abs(expected) * Decimal('0.001')
+
+
+def _line_discount(line):
+    if line.get(DISCOUNT_PERCENT):
+        return Decimal(str(line[DISCOUNT_PERCENT])), 'percent'
+    if line.get(DISCOUNT_AMOUNT):
+        return Decimal(str(line[DISCOUNT_AMOUNT])), 'amount'
+    return None, None
+
+
+def _resolve_discount(item, line, label, incl_vat):
+    """A plain 'discount' is only sent when a supplier rule says what it is."""
+    raw = item.get(DISCOUNT_TAG)
+    if raw is None or str(raw).strip() == '' or DISCOUNT_PERCENT in line or DISCOUNT_AMOUNT in line:
+        return []
+    try:
+        discount = _number(raw)
+    except (InvalidOperation, ValueError, OverflowError):
+        return [f'{label}: discount "{raw}" is not a number.']
+    if discount == 0:
+        return []
+    printed = str(raw).strip()
+    if '%' in printed or re.search(r'[£$€]', printed):  # printed '10%' or '£92.79' says which one it is
+        field = DISCOUNT_PERCENT if '%' in printed else DISCOUNT_AMOUNT
+        line[field] = float(abs(discount))
+        return []
+    as_percent = _fits(line, bool(incl_vat), discount, 'percent')
+    as_amount = _fits(line, bool(incl_vat), discount, 'amount')
+    hint = (' Line maths suggests it is a %.' if as_percent and not as_amount else
+            ' Line maths suggests it is an amount.' if as_amount and not as_percent else '')
+    return [f'{label}: discount {raw} has no supplier rule (% or amount).{hint} '
+            f'Add a supplier rule in Admin > BC Field Mapping.']
+
+
+def _check_line(line, label, incl_vat):
+    """Catch a discount rule or VAT price basis that does not match the printed line total."""
+    reasons = []
+    percent = line.get(DISCOUNT_PERCENT)
+    if percent is not None and not 0 <= percent <= 100:
+        reasons.append(f'{label}: Line Discount % is {percent}, which is not between 0 and 100.')
+    discount, kind = _line_discount(line)
+    basis = bool(incl_vat)
+    if _fits(line, basis, discount, kind) is not False:
+        return reasons
+    if _fits(line, not basis, discount, kind):
+        if incl_vat is None:
+            reasons.append(f'{label}: unit price looks VAT-inclusive. Set "Prices Including VAT" for this '
+                           'supplier in Admin > BC Field Mapping.')
+        else:
+            reasons.append(f'{label}: unit price does not match the supplier setting Prices Including VAT = '
+                           f'{"Yes" if incl_vat else "No"}. Check the supplier setting.')
+    elif discount and _fits(line, basis, discount, 'amount' if kind == 'percent' else 'percent'):
+        other = 'an amount' if kind == 'percent' else 'a %'
+        field = DISCOUNT_PERCENT if kind == 'percent' else DISCOUNT_AMOUNT
+        reasons.append(f'{label}: {field} {line[field]} does not match the line total, but it would as '
+                       f'{other}. Check the supplier rule.')
+    return reasons
+
+
+# ---- VAT by tax band ----------------------------------------------------------
+
+def _round(value, places):
+    return value.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+
+
+def vat_summary(lines, invoice_vat, vat_rules):
+    """Recalculate VAT per tax band the way BC does and compare it with the invoice VAT."""
+    places = vat_rules['lineRoundingDecimals']
+    tolerance = Decimal(str(vat_rules['maxVatDifference']))
+    bands, reasons = {}, []
+    for index, line in enumerate(lines, 1):
+        label = f'Line {line.get("Line No.", index)}'
+        rate = _dec(line, 'VAT %')
+        net, gross = _dec(line, 'Amount'), _dec(line, 'Amount Including VAT')
+        if net is None and gross is None:
+            continue  # no amount: already reported by the line checks
+        if rate is None:
+            reasons.append(f'{label}: VAT % is missing, so VAT cannot be checked by tax band.')
+            continue
+        if net is None:
+            net = gross * 100 / (100 + rate)
+        band = bands.setdefault(rate, [Decimal(0), Decimal(0)])
+        band[0] += _round(net, places)
+        band[1] += _round(net * rate / 100, places)
+    summary = {
+        'bands': [{'VAT %': float(rate), 'Amount': float(_round(net, 2)), 'VAT Amount': float(_round(vat, 2))}
+                  for rate, (net, vat) in sorted(bands.items())],
+        'calculatedVat': None, 'invoiceVat': invoice_vat, 'vatDifference': None,
+        'maxVatDifference': float(tolerance),
+    }
+    if reasons or not bands:
+        return summary, reasons
+    calculated = sum(_round(vat, 2) for _, vat in bands.values())
+    summary['calculatedVat'] = float(calculated)
+    if invoice_vat is None:
+        return summary, reasons
+    difference = _round(Decimal(str(invoice_vat)) - calculated, 2)
+    summary['vatDifference'] = float(difference)
+    if abs(difference) > tolerance:
+        reasons.append(f'Invoice VAT {invoice_vat} differs from VAT calculated by tax band {calculated} by '
+                       f'{difference} (allowed {tolerance}).')
+    return summary, reasons
+
+
+# ---- all PDF data + additionalFields --------------------------------------------
+
+def _empty(value):
+    return value is None or value == '' or value == [] or value == {} or (
+        isinstance(value, str) and not value.strip())
+
+
+def _public(value):
+    """Drop DocMate-internal '_' keys inside nested values (e.g. VAT breakdown rows)."""
+    if isinstance(value, dict):
+        return {k: _public(v) for k, v in value.items() if not str(k).startswith('_')}
+    if isinstance(value, list):
+        return [_public(v) for v in value]
+    return value
+
+
+def _calculated(evidence, value, zero_ok):
+    """Numbers and dates missing from the PDF were worked out by DocMate. Text values
+    (names, references, addresses) are read, not calculated, so they always count as PDF data."""
+    if evidence is None or isinstance(value, bool):
+        return False
+    if isinstance(value, str) and not _ISO_DATE.match(value.strip()):
+        return False
+    if not isinstance(value, (str, int, float, Decimal)):
+        return False
+    return evidence.printed(value, zero_counts=zero_ok) is False
+
+
+def _pdf_evidence(header, source_text):
+    """Use the PDF text only when it is good enough to find the invoice number or total."""
+    if not source_text:
+        return None, 'No PDF text was available, so all values are treated as PDF data.'
+    evidence = PdfEvidence(source_text)
+    anchors = [header.get(k) for k in ('invoiceNumber', 'totalGross', 'totalAmount') if not _empty(header.get(k))]
+    if not evidence.available or not any(evidence.printed(v) for v in anchors):
+        return None, ('PDF text does not show the invoice number or total (poor OCR), '
+                      'so all values are treated as PDF data.')
+    return evidence, 'Values were checked against the PDF text.'
+
+
+def _split(source, mapped_result, used, entries, evidence):
+    """PDF data (BC tag when mapped, DocMate tag otherwise) and DocMate-calculated additionalFields."""
+    data, additional = {}, {}
+    excluded_tags = {tag for e in entries if is_excluded_field(e['bcField'])
+                     for tag in e['docmateTags']}
+    for alias, field in used.items():
+        if is_excluded_field(field):
+            continue
+        raw = source.get(alias, mapped_result[field])
+        if field in ALWAYS_IN_DATA or not _calculated(evidence, raw, zero_ok=field in ZERO_MEANINGFUL):
+            data[field] = mapped_result[field]
+        else:
+            additional[field] = mapped_result[field]
+    alias_field = {tag: e['bcField'] for e in entries for tag in e['docmateTags']}
+    winners = {field: alias for alias, field in used.items()}
+    for key, value in source.items():
+        if str(key).startswith('_') or key in used or key in excluded_tags or _empty(value):
+            continue
+        field = alias_field.get(key)
+        if field in winners and source.get(winners[field]) == value:
+            continue  # same value as the tag already sent for this BC field
+        clean = _public(value)
+        if key in SYSTEM_TAGS:
+            additional[key] = clean
+        elif isinstance(value, list) and any(isinstance(r, dict) and '_source' in r for r in value):
+            printed = [_public(r) for r in value if not (isinstance(r, dict) and r.get('_source') == 'calculated')]
+            calc = [_public(r) for r in value if isinstance(r, dict) and r.get('_source') == 'calculated']
+            if printed:
+                data[key] = printed
+            if calc:
+                additional[key] = calc
+        elif _calculated(evidence, value, zero_ok=False):
+            additional[key] = clean
+        else:
+            data[key if key not in data else f'docmate.{key}'] = clean
+    return data, additional
+
+
+def _extract_delivery_charge(header):
+    """Extract delivery/shipping/freight charge from header if > 0."""
+    for tag in DELIVERY_HEADER_TAGS:
+        raw = header.get(tag)
+        if raw is None:
+            continue
+        try:
+            amount = float(_number(raw))
+        except (InvalidOperation, ValueError, OverflowError):
+            continue
+        if amount > 0:
+            return amount, tag
+    return None, None
+
+
+def _make_delivery_line(amount, existing_lines):
+    """Create a delivery charge line item using existing BC line field names."""
+    max_line_no = 0
+    for line in existing_lines:
+        ln = line.get('Line No.', 0)
+        if isinstance(ln, (int, float)) and ln > max_line_no:
+            max_line_no = int(ln)
+    line_no = (max_line_no if max_line_no > 0 else len(existing_lines)) + 1
+    return {
+        'Line No.': line_no,
+        'Vendor Item No.': DELIVERY_ITEM_CODE,
+        'Description': DELIVERY_DESCRIPTION,
+        'Quantity': 1,
+        'Direct Unit Cost': amount,
+        'Amount': amount,
+        'VAT %': 0.0,
+        'Amount Including VAT': amount,
+        'additionalFields': {},
+    }
+
+
+def map_bc_tables(header, items, mapped, field_mapping=None, source_text=None):
+    """Map extracted fields; keep master-data enrichment explicitly separate.
+
+    Every extracted value is sent: mapped ones under their BC tag, the rest under their
+    DocMate tag. Values DocMate calculated (not printed on the PDF) go to additionalFields.
+    Checks (discount, prices incl. VAT, VAT by tax band) run on all values first.
+    """
+    field_mapping = field_mapping or load_field_mapping()
+    supplier = header.get('supplierName')
+    rules = supplier_rules_for(field_mapping, supplier)
+    incl_vat = prices_including_vat_for(field_mapping, supplier)
+    header_entries = _effective_entries(field_mapping['header'], rules, 'header')
+    line_entries = _effective_entries(field_mapping['lines'], rules, 'lines')
+    result_header, header_used = _map(header, header_entries)
+    result_lines, lines_used, review = [], [], []
+    for index, item in enumerate(items, 1):
+        line, used = _map(item, line_entries)
+        label = f'Line {line.get("Line No.", index)}'
+        unresolved = _resolve_discount(item, line, label, incl_vat)
+        # Line maths is meaningless while the discount type is unknown.
+        review += unresolved or _check_line(line, label, incl_vat)
+        result_lines.append(line)
+        lines_used.append(used)
+    vat, vat_reasons = vat_summary(result_lines, result_header.get('Doc. Amount VAT'),
+                                   field_mapping.get('vatRules', DEFAULT_VAT_RULES))
+    review += vat_reasons
+
+    evidence, pdf_check = _pdf_evidence(header, source_text)
+    out_header, header_additional = _split(header, result_header, header_used, header_entries, evidence)
+    out_lines = []
+    for item, line, used in zip(items, result_lines, lines_used):
+        data, additional = _split(item, line, used, line_entries, evidence)
+        out_lines.append({**data, 'additionalFields': additional})
+    # Settings and BC master data are DocMate configuration, always sent as data.
+    if incl_vat is not None:
+        out_header[PRICES_INCL_VAT] = incl_vat
+    # Confirmed OCR vendor mapping takes priority over master-data enrichment.
+    vendor = mapped['buffer_header'].get('BcVendorNo')
+    if vendor:
+        out_header.setdefault('Buy-from Vendor No.', vendor)
+    for i, line in enumerate(out_lines):
+        account = mapped['buffer_lines'][i].get('BcGlAccount') if i < len(mapped['buffer_lines']) else None
+        if account:
+            line.update({'Type': 'G/L Account', 'No.': account})
+    out_header['additionalFields'] = header_additional
+    # Delivery charge: convert header-level charge to a line item with fixed code DELIVERY.
+    # BC handles it per client setup (non-stock item, G/L account, etc.).
+    delivery_amount, delivery_tag = _extract_delivery_charge(header)
+    if delivery_amount is not None:
+        out_lines.append(_make_delivery_line(delivery_amount, out_lines))
+        # Remove from header to avoid duplication; it is now in the lines.
+        for tag in DELIVERY_HEADER_TAGS:
+            out_header.pop(tag, None)
+            header_additional.pop(tag, None)
+    # invoiceHeader, invoiceLines, vatSummary and pdfCheck are sent to BC; the rest is for review and logging.
+    return {'invoiceHeader': out_header, 'invoiceLines': out_lines, 'vatSummary': vat,
+            'pdfCheck': {'checked': evidence is not None, 'note': pdf_check},
+            'reviewReasons': review, 'tagMap': {'header': header_used, 'lines': lines_used},
+            'supplierRulesApplied': [f"{r['docmateTag']} -> {r['bcField']}" for r in rules]
+            + ([f'{PRICES_INCL_VAT} = {incl_vat}'] if incl_vat is not None else [])}
+
+
+def _is_noise(text):
+    """True when the text looks like terms & conditions, legal, or help text."""
+    return bool(_NOTE_NOISE.search(str(text or '')))
+
+
+def clean_pdf_data(pdf_data):
+    """Remove non-business noise (T&C, legal text, help/FAQ, payment how-to) from captured PDF data.
+
+    Keeps fields, tables, addresses, and pages (raw text) intact. Only filters
+    gemini.notes and blocks which contain supplementary text that is not useful for BC.
+    """
+    if not isinstance(pdf_data, dict):
+        return pdf_data
+    cleaned = dict(pdf_data)
+
+    # Clean gemini notes (T&C, legal disclaimers, payment instructions, URLs).
+    gemini = cleaned.get('gemini')
+    if isinstance(gemini, dict):
+        gemini = dict(gemini)
+        notes = gemini.get('notes')
+        if isinstance(notes, list):
+            gemini['notes'] = [n for n in notes if not _is_noise(n)]
+        cleaned['gemini'] = gemini
+
+    # Clean blocks (supplementary text fragments that are noise).
+    blocks = cleaned.get('blocks')
+    if isinstance(blocks, list):
+        cleaned['blocks'] = [
+            b for b in blocks
+            if not _is_noise(b.get('text', '') if isinstance(b, dict) else b)
+        ]
+
+    return cleaned
+
+
+def generate_al_snippet(field_mapping=None):
+    """AL reader code matching the current mapping, for the BC developer to paste."""
+    field_mapping = field_mapping or load_field_mapping()
+    getter = {'text': 'GetText', 'decimal': 'GetDecimal', 'integer': 'GetInteger', 'date': 'GetDate'}
+
+    def lines(entries, obj, indent):
+        entries = [e for e in entries if not is_excluded_field(e['bcField'])]
+        width = max((len(e['docmateTags'][0]) for e in entries), default=0)
+        return [f"{indent}{e['docmateTags'][0].ljust(width)} := {obj}.{getter[e['type']]}('{e['bcField']}');"
+                for e in entries]
+
+    return '\n'.join([
+        '// Generated by DocMate (Admin > BC Field Mapping). CombinedJson = { taskId, pdfData }.',
+        '// Fields are only sent when found on the invoice: check ContainsKey before reading.',
+        '// Values DocMate calculated (not printed on the PDF), e.g. a Due Date worked out from payment',
+        "// terms, are in each object's 'additionalFields' under the same tag.",
+        '// Extracted values without a BC tag are sent under their DocMate tag (e.g. paymentTerms).',
+        "PdfData := JsonObject.GetObject('pdfData');",
+        "HeaderObject := PdfData.GetObject('invoiceHeader');",
+        *lines(field_mapping['header'], 'HeaderObject', ''),
+        "pricesIncludingVat := HeaderObject.GetBoolean('Prices Including VAT'); // only for suppliers with a setting",
+        '',
+        "JsonArray := PdfData.GetArray('invoiceLines');",
+        'foreach JsonToken in JsonArray do begin',
+        '    JsonLineObject := JsonToken.AsObject();',
+        *lines(field_mapping['lines'], 'JsonLineObject', '    '),
+        'end;',
+        '',
+        '// VAT per tax band, recalculated like BC (lines 5 decimals, band totals 2 decimals).',
+        "VatObject := PdfData.GetObject('vatSummary');",
+        "vatDifference := VatObject.GetDecimal('vatDifference'); // invoice VAT - calculated, within tolerance",
+        "foreach JsonToken in VatObject.GetArray('bands') do begin",
+        '    BandObject := JsonToken.AsObject();',
+        "    bandVatRate := BandObject.GetDecimal('VAT %');",
+        "    bandAmount  := BandObject.GetDecimal('Amount');",
+        "    bandVat     := BandObject.GetDecimal('VAT Amount');",
+        'end;',
+    ])

@@ -1,0 +1,4 @@
+server: "."
+database: "OcrDynamics"
+username: "sa"
+password: "mg812yn"

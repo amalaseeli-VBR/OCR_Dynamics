@@ -1,0 +1,267 @@
+{
+  "header": [
+    {
+      "bcField": "Buy-from Vendor Name",
+      "docmateTags": [
+        "supplierName"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Ship-to Name",
+      "docmateTags": [
+        "customerName",
+        "customer_name"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Vendor Invoice No.",
+      "docmateTags": [
+        "invoiceNumber"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Document Date",
+      "docmateTags": [
+        "invoiceDate"
+      ],
+      "type": "date"
+    },
+    {
+      "bcField": "Due Date",
+      "docmateTags": [
+        "dueDate",
+        "paymentDueDate"
+      ],
+      "type": "date"
+    },
+    {
+      "bcField": "Vendor Order No.",
+      "docmateTags": [
+        "orderNumber",
+        "orderNo"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Our Account No.",
+      "docmateTags": [
+        "accountNumber",
+        "accountNo"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Your Reference",
+      "docmateTags": [
+        "customerPONumber",
+        "purchaseOrderNumber",
+        "poNumber"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Currency Code",
+      "docmateTags": [
+        "currency"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "VAT Registration No.",
+      "docmateTags": [
+        "supplierVatNo",
+        "vatRegistrationNumber",
+        "vatNumber",
+        "supplierVatNumber"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Buy-from Address",
+      "docmateTags": [
+        "supplierAddressLine1"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Buy-from Address 2",
+      "docmateTags": [
+        "supplierAddressLine2"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Buy-from City",
+      "docmateTags": [
+        "supplierCity"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Buy-from Postcode",
+      "docmateTags": [
+        "supplierPostCode",
+        "supplierPostalCode"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Buy-from Country/Region Code",
+      "docmateTags": [
+        "supplierCountryCode"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Vendor Shipment No.",
+      "docmateTags": [
+        "deliveryNoteNumber",
+        "deliveryNoteNo"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Amount",
+      "docmateTags": [
+        "totalNet"
+      ],
+      "type": "decimal"
+    },
+    {
+      "bcField": "Doc. Amount VAT",
+      "docmateTags": [
+        "totalVat"
+      ],
+      "type": "decimal"
+    },
+    {
+      "bcField": "Doc. Amount Incl. VAT",
+      "docmateTags": [
+        "totalGross",
+        "totalAmount"
+      ],
+      "type": "decimal"
+    }
+  ],
+  "lines": [
+    {
+      "bcField": "Line No.",
+      "docmateTags": [
+        "lineNo",
+        "lineNumber"
+      ],
+      "type": "integer"
+    },
+    {
+      "bcField": "Vendor Item No.",
+      "docmateTags": [
+        "code",
+        "itemCode",
+        "item_code"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Description",
+      "docmateTags": [
+        "description"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Description 2",
+      "docmateTags": [
+        "description2"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Unit of Measure",
+      "docmateTags": [
+        "unitOfMeasure",
+        "unitSize"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Unit of Measure Code",
+      "docmateTags": [
+        "unitOfMeasureCode"
+      ],
+      "type": "text"
+    },
+    {
+      "bcField": "Quantity",
+      "docmateTags": [
+        "qty",
+        "quantity"
+      ],
+      "type": "decimal"
+    },
+    {
+      "bcField": "Direct Unit Cost",
+      "docmateTags": [
+        "unitPrice",
+        "price"
+      ],
+      "type": "decimal"
+    },
+    {
+      "bcField": "Line Discount %",
+      "docmateTags": [
+        "discountPercent",
+        "discountRate",
+        "discountPct"
+      ],
+      "type": "decimal"
+    },
+    {
+      "bcField": "Line Discount Amount",
+      "docmateTags": [
+        "discountAmount",
+        "lineDiscount"
+      ],
+      "type": "decimal"
+    },
+    {
+      "bcField": "Amount",
+      "docmateTags": [
+        "lineNet",
+        "netAmount",
+        "lineAmount"
+      ],
+      "type": "decimal"
+    },
+    {
+      "bcField": "VAT %",
+      "docmateTags": [
+        "vatRate",
+        "vat_rate"
+      ],
+      "type": "decimal"
+    },
+    {
+      "bcField": "Amount Including VAT",
+      "docmateTags": [
+        "lineGross"
+      ],
+      "type": "decimal"
+    }
+  ],
+  "supplierRules": [
+    {
+      "supplier": "Booker",
+      "section": "lines",
+      "docmateTag": "discount",
+      "bcField": "Line Discount %"
+    }
+  ],
+  "supplierSettings": [],
+  "vatRules": {
+    "maxVatDifference": 0.01,
+    "lineRoundingDecimals": 5
+  }
+}
